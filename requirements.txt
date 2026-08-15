@@ -1,0 +1,7 @@
+gradio
+google-genai
+python-dotenv
+pymupdf
+faiss-cpu
+sentence-transformers
+numpy
