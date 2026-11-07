@@ -135,31 +135,52 @@ def process_document(pdf_path):
         exist_ok=True
     )
 
-    # --------------------------------------------------------
-    # Remove old vectorstore
-    # --------------------------------------------------------
-
-    if os.path.exists(INDEX_PATH):
-        os.remove(INDEX_PATH)
-
-    if os.path.exists(CHUNKS_PATH):
-        os.remove(CHUNKS_PATH)
 
     # --------------------------------------------------------
-    # Save FAISS index
+    # Save vectorstore safely
     # --------------------------------------------------------
 
-    faiss.write_index(
-        index,
-        INDEX_PATH
+    os.makedirs(
+        VECTORSTORE_DIR,
+        exist_ok=True
     )
 
-    # --------------------------------------------------------
-    # Save chunks
-    # --------------------------------------------------------
+    temp_index_path = INDEX_PATH + ".tmp"
+    temp_chunks_path = CHUNKS_PATH + ".tmp"
 
-    with open(CHUNKS_PATH, "wb") as f:
-        pickle.dump(chunks, f)
+    try:
+
+        # Write both temporary files first.
+        faiss.write_index(
+            index,
+            temp_index_path
+        )
+
+        with open(temp_chunks_path, "wb") as f:
+            pickle.dump(chunks, f)
+
+        # Replace the existing files only after both writes succeed.
+        os.replace(
+            temp_index_path,
+            INDEX_PATH
+        )
+
+        os.replace(
+            temp_chunks_path,
+            CHUNKS_PATH
+        )
+
+    finally:
+
+        # Clean up temporary files if anything failed.
+        for temp_path in (
+            temp_index_path,
+            temp_chunks_path
+        ):
+
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
 
     # --------------------------------------------------------
     # Final result
