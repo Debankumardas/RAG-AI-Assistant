@@ -44,7 +44,7 @@ print("Embedding model loaded.")
 # PROCESS DOCUMENT
 # ============================================================
 
-def process_document(pdf_path):
+def process_document(pdf_path, vectorstore_dir=None):
     """
     Process a PDF and publish a new versioned vectorstore generation.
 
@@ -57,6 +57,12 @@ def process_document(pdf_path):
     The previous generation remains untouched until the new
     generation has been written, verified, and published.
     """
+    vectorstore_dir = Path(
+    vectorstore_dir or VECTORSTORE_DIR
+    ).resolve()
+
+    generations_dir = vectorstore_dir / "generations"
+    manifest_path = vectorstore_dir / "manifest.json"
 
     pdf_path = os.path.abspath(pdf_path)
 
@@ -175,12 +181,12 @@ def process_document(pdf_path):
 
     generation_id = uuid.uuid4().hex
 
-    generation_dir = GENERATIONS_DIR / generation_id
+    generation_dir = generations_dir / generation_id
 
     index_path = generation_dir / "index.faiss"
     chunks_path = generation_dir / "chunks.pkl"
 
-    manifest_temp_path = VECTORSTORE_DIR / (
+    manifest_temp_path = vectorstore_dir / (
         f"manifest.{generation_id}.tmp"
     )
 
@@ -191,12 +197,12 @@ def process_document(pdf_path):
         # CREATE DIRECTORIES
         # ----------------------------------------------------
 
-        VECTORSTORE_DIR.mkdir(
+        vectorstore_dir.mkdir(
             parents=True,
             exist_ok=True
         )
 
-        GENERATIONS_DIR.mkdir(
+        generations_dir.mkdir(
             parents=True,
             exist_ok=True
         )
@@ -294,7 +300,7 @@ def process_document(pdf_path):
 
         os.replace(
             manifest_temp_path,
-            MANIFEST_PATH
+            manifest_path
         )
 
         published = True
@@ -323,7 +329,7 @@ def process_document(pdf_path):
     print(f"Chunks: {len(chunks)}")
     print(f"Embedding dimension: {dimension}")
     print(f"Generation: {generation_id}")
-    print(f"Manifest: {MANIFEST_PATH}")
+    print(f"Manifest: {manifest_path}")
 
     print("=" * 60)
 

@@ -374,3 +374,131 @@ def test_manifest_replacement_failure_preserves_existing_vectorstore(
     # The old generation's files must remain untouched.
     assert existing["index_path"].read_bytes() == existing["original_index"]
     assert existing["chunks_path"].read_bytes() == existing["original_chunks"]
+
+def test_process_document_isolates_separate_vectorstores(
+    tmp_path,
+    monkeypatch,
+):
+    first_pdf = tmp_path / "session_a.pdf"
+    second_pdf = tmp_path / "session_b.pdf"
+
+    first_pdf.write_bytes(b"fake pdf A")
+    second_pdf.write_bytes(b"fake pdf B")
+
+    first_vectorstore = tmp_path / "session_a" / "vectorstore"
+    second_vectorstore = tmp_path / "session_b" / "vectorstore"
+
+    def fake_extract_pages(pdf_path):
+        if pdf_path.endswith("session_a.pdf"):
+            return [
+                {
+                    "page_number": 1,
+                    "text": "Content belonging to session A",
+                }
+            ]
+
+        return [
+            {
+                "page_number": 1,
+                "text": "Content belonging to session B",
+            }
+        ]
+
+    def fake_create_chunks(
+        pages,
+        chunk_size,
+        overlap,
+        document_name,
+    ):
+        return [
+            {
+                "chunk_id": 0,
+                "text": pages[0]["text"],
+                "page_number": 1,
+                "document_name": document_name,
+            }
+        ]
+
+    class FakeEmbeddingModel:
+        def encode(self, texts, **kwargs):
+            return np.array(
+                [[1.0, 0.0, 0.0]],
+                dtype=np.float32,
+            )
+
+    monkeypatch.setattr(
+        document_manager,
+        "extract_pages_from_pdf",
+        fake_extract_pages,
+    )
+
+    monkeypatch.setattr(
+        document_manager,
+        "create_chunks",
+        fake_create_chunks,
+    )
+
+    monkeypatch.setattr(
+        document_manager,
+        "embedding_model",
+        FakeEmbeddingModel(),
+    )
+
+    # Process session A's document.
+    first_result = document_manager.process_document(
+        str(first_pdf),
+        vectorstore_dir=first_vectorstore,
+    )
+
+    assert first_result["success"] is True
+
+    first_manifest_path = first_vectorstore / "manifest.json"
+    first_manifest_before = json.loads(
+        first_manifest_path.read_text(encoding="utf-8")
+    )
+
+    # Process session B's document.
+    second_result = document_manager.process_document(
+        str(second_pdf),
+        vectorstore_dir=second_vectorstore,
+    )
+
+    assert second_result["success"] is True
+
+    second_manifest_path = second_vectorstore / "manifest.json"
+
+    first_manifest_after = json.loads(
+        first_manifest_path.read_text(encoding="utf-8")
+    )
+    second_manifest = json.loads(
+        second_manifest_path.read_text(encoding="utf-8")
+    )
+
+    # Each session has its own generation.
+    assert (
+        first_manifest_before["generation_id"]
+        != second_manifest["generation_id"]
+    )
+
+    # Processing session B must not change session A's manifest.
+    assert first_manifest_after == first_manifest_before
+
+    # Verify the actual saved chunk contents.
+    first_chunks_path = (
+        first_vectorstore / first_manifest_after["chunks_path"]
+    )
+    second_chunks_path = (
+        second_vectorstore / second_manifest["chunks_path"]
+    )
+
+    with open(first_chunks_path, "rb") as file:
+        first_chunks = pickle.load(file)
+
+    with open(second_chunks_path, "rb") as file:
+        second_chunks = pickle.load(file)
+
+    assert first_chunks[0]["text"] == "Content belonging to session A"
+    assert second_chunks[0]["text"] == "Content belonging to session B"
+
+    assert first_chunks[0]["document_name"] == "session_a.pdf"
+    assert second_chunks[0]["document_name"] == "session_b.pdf"

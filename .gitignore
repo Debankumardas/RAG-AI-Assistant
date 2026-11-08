@@ -17,6 +17,9 @@ __pycache__/
 # Generated vectorstore data
 vectorstore/
 
+# User session data
+sessions/
+
 # IDE and editor files
 .vscode/
 .idea/

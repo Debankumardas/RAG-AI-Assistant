@@ -2,27 +2,39 @@ import gradio as gr
 
 from rag_engine import ask_rag
 from document_manager import process_document
-
-
-# ============================================================
-# GLOBAL DOCUMENT STATE
-# ============================================================
-
-current_document = "No document uploaded"
-
+from session_manager import get_session_vectorstore_dir
 
 # ============================================================
 # CHAT FUNCTION
 # ============================================================
 
-def chat(message, history):
+def chat(message, history, request: gr.Request):
+
+    history = history or []
 
     if not message or not message.strip():
         return history, ""
 
     try:
+        vectorstore_dir = get_session_vectorstore_dir(request)
 
-        answer = ask_rag(message.strip())
+        manifest_path = vectorstore_dir / "manifest.json"
+
+        if not manifest_path.is_file():
+            history.append({
+                "role": "user",
+                "content": message.strip()
+            })
+            history.append({
+                "role": "assistant",
+                "content": "Please upload a PDF before asking questions."
+            })
+            return history, ""
+
+        answer = ask_rag(
+            message.strip(),
+            vectorstore_dir=vectorstore_dir
+        )
 
         history.append({
             "role": "user",
@@ -37,7 +49,6 @@ def chat(message, history):
         return history, ""
 
     except Exception as e:
-
         history.append({
             "role": "user",
             "content": message.strip()
@@ -45,7 +56,7 @@ def chat(message, history):
 
         history.append({
             "role": "assistant",
-            "content": f"⚠️ Error: {str(e)}"
+            "content": f"Error: {str(e)}"
         })
 
         return history, ""
@@ -63,50 +74,44 @@ def clear_chat():
 # PDF UPLOAD / PROCESSING
 # ============================================================
 
-def upload_document(file):
-
-    global current_document
+def upload_document(file, request: gr.Request):
 
     if file is None:
-        return "⚠️ Please select a PDF file."
+        return "Please select a PDF file."
 
     try:
+        pdf_path = str(file)
 
-        # Gradio provides the temporary uploaded file path
-        pdf_path = file
-
-        # Make sure it is a PDF
         if not pdf_path.lower().endswith(".pdf"):
-            return "⚠️ Only PDF files are supported."
+            return "Only PDF files are supported."
 
         print("\n" + "=" * 60)
         print("NEW DOCUMENT UPLOAD")
         print("=" * 60)
-
         print(f"PDF: {pdf_path}")
 
-        # Process document
-        result = process_document(pdf_path)
+        vectorstore_dir = get_session_vectorstore_dir(request)
+
+        result = process_document(
+            pdf_path,
+            vectorstore_dir=vectorstore_dir
+        )
 
         if not result["success"]:
-            return f"❌ {result['message']}"
-
-        current_document = result["filename"]
+            return f"{result['message']}"
 
         return (
-            f"✅ **Document processed successfully!**\n\n"
-            f"📄 **Document:** {result['filename']}\n\n"
-            f"📝 **Characters:** {result['characters']}\n\n"
-            f"📚 **Chunks:** {result['chunks']}\n\n"
-            f"🧠 **Embedding dimension:** {result['dimension']}\n\n"
+            f" **Document processed successfully!**\n\n"
+            f" **Document:** {result['filename']}\n\n"
+            f" **Characters:** {result['characters']}\n\n"
+            f" **Chunks:** {result['chunks']}\n\n"
+            f" **Embedding dimension:** {result['dimension']}\n\n"
             f"Your document is now ready. Ask a question below."
         )
 
     except Exception as e:
-
         print("UPLOAD ERROR:", str(e))
-
-        return f"❌ Error processing document: {str(e)}"
+        return f" Error processing document: {str(e)}"
 
 
 # ============================================================

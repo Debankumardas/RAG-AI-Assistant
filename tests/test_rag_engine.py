@@ -10,7 +10,7 @@ import rag_engine
 
 
 @pytest.fixture
-def vectorstore_environment(tmp_path, monkeypatch):
+def vectorstore_environment(tmp_path):
     """Create an isolated vectorstore environment for each test."""
 
     vectorstore_dir = tmp_path / "vectorstore"
@@ -19,20 +19,13 @@ def vectorstore_environment(tmp_path, monkeypatch):
 
     manifest_path = vectorstore_dir / "manifest.json"
 
-    monkeypatch.setattr(rag_engine, "VECTORSTORE_DIR", vectorstore_dir)
-    monkeypatch.setattr(rag_engine, "MANIFEST_PATH", manifest_path)
-
-    rag_engine._clear_vectorstore()
-
-    yield vectorstore_dir, generations_dir, manifest_path
-
-    rag_engine._clear_vectorstore()
+    return vectorstore_dir, generations_dir, manifest_path
 
 
 class FakeEmbeddingModel:
     """Return predictable embeddings for retrieval tests."""
 
-    def encode(self, texts, normalize_embeddings=True):
+    def encode(self, texts, normalize_embeddings=True, **kwargs):
         return np.array([[1.0, 0.0]], dtype=np.float32)
 
 
@@ -112,7 +105,7 @@ def write_manifest(manifest_path, manifest):
 # ============================================================
 
 def test_load_vectorstore_success(vectorstore_environment):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     expected_chunks = create_chunks()
 
@@ -123,33 +116,41 @@ def test_load_vectorstore_success(vectorstore_environment):
 
     write_manifest(manifest_path, manifest)
 
-    assert rag_engine.load_vectorstore(force_reload=True) is True
+    result = rag_engine.load_vectorstore(
+        vectorstore_dir=vectorstore_dir
+    )
 
-    assert rag_engine.index is not None
-    assert rag_engine.index.ntotal == 2
-    assert rag_engine.index.d == 2
-    assert rag_engine.chunks == expected_chunks
+    assert result is not None
+
+    loaded_index, loaded_chunks = result
+
+    assert loaded_index is not None
+    assert loaded_index.ntotal == 2
+    assert loaded_index.d == 2
+    assert loaded_chunks == expected_chunks
 
 
 def test_load_vectorstore_rejects_invalid_manifest(
     vectorstore_environment,
 ):
-    _, _, manifest_path = vectorstore_environment
+    vectorstore_dir, _, manifest_path = vectorstore_environment
 
     manifest_path.write_text(
         '{"generation_id": "generation-1"}',
         encoding="utf-8",
     )
 
-    assert rag_engine.load_vectorstore(force_reload=True) is False
-    assert rag_engine.index is None
-    assert rag_engine.chunks == []
+    result = rag_engine.load_vectorstore(
+        vectorstore_dir=vectorstore_dir
+    )
+
+    assert result is None
 
 
 def test_manifest_path_traversal_is_rejected(
     vectorstore_environment,
 ):
-    _, _, manifest_path = vectorstore_environment
+    vectorstore_dir, _, manifest_path = vectorstore_environment
 
     manifest = {
         "generation_id": "generation-1",
@@ -164,58 +165,74 @@ def test_manifest_path_traversal_is_rejected(
 
     write_manifest(manifest_path, manifest)
 
-    assert rag_engine.get_vectorstore_signature() is None
-    assert rag_engine.load_vectorstore(force_reload=True) is False
+    assert (
+        rag_engine.get_vectorstore_signature(vectorstore_dir)
+        is None
+    )
+
+    assert (
+        rag_engine.load_vectorstore(
+            vectorstore_dir=vectorstore_dir
+        )
+        is None
+    )
 
 
 def test_load_vectorstore_rejects_chunk_count_mismatch(
     vectorstore_environment,
 ):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     manifest = create_generation(generations_dir)
     manifest["chunk_count"] = 10
 
     write_manifest(manifest_path, manifest)
 
-    assert rag_engine.load_vectorstore(force_reload=True) is False
-    assert rag_engine.index is None
-    assert rag_engine.chunks == []
+    result = rag_engine.load_vectorstore(
+        vectorstore_dir=vectorstore_dir
+    )
+
+    assert result is None
 
 
 def test_load_vectorstore_rejects_embedding_dimension_mismatch(
     vectorstore_environment,
 ):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     manifest = create_generation(generations_dir)
     manifest["embedding_dimension"] = 5
 
     write_manifest(manifest_path, manifest)
 
-    assert rag_engine.load_vectorstore(force_reload=True) is False
-    assert rag_engine.index is None
+    result = rag_engine.load_vectorstore(
+        vectorstore_dir=vectorstore_dir
+    )
+
+    assert result is None
 
 
 def test_load_vectorstore_rejects_unsupported_chunk_format(
     vectorstore_environment,
 ):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     manifest = create_generation(generations_dir)
     manifest["chunk_format_version"] = 1
 
     write_manifest(manifest_path, manifest)
 
-    assert rag_engine.load_vectorstore(force_reload=True) is False
-    assert rag_engine.index is None
-    assert rag_engine.chunks == []
+    result = rag_engine.load_vectorstore(
+        vectorstore_dir=vectorstore_dir
+    )
+
+    assert result is None
 
 
 def test_load_vectorstore_rejects_invalid_chunk_metadata(
     vectorstore_environment,
 ):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     invalid_chunks = create_chunks()
     invalid_chunks[0]["page_number"] = 0
@@ -227,15 +244,17 @@ def test_load_vectorstore_rejects_invalid_chunk_metadata(
 
     write_manifest(manifest_path, manifest)
 
-    assert rag_engine.load_vectorstore(force_reload=True) is False
-    assert rag_engine.index is None
-    assert rag_engine.chunks == []
+    result = rag_engine.load_vectorstore(
+        vectorstore_dir=vectorstore_dir
+    )
+
+    assert result is None
 
 
 def test_load_vectorstore_rejects_document_name_mismatch(
     vectorstore_environment,
 ):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     invalid_chunks = create_chunks()
     invalid_chunks[0]["document_name"] = "another.pdf"
@@ -247,14 +266,17 @@ def test_load_vectorstore_rejects_document_name_mismatch(
 
     write_manifest(manifest_path, manifest)
 
-    assert rag_engine.load_vectorstore(force_reload=True) is False
-    assert rag_engine.index is None
+    result = rag_engine.load_vectorstore(
+        vectorstore_dir=vectorstore_dir
+    )
+
+    assert result is None
 
 
 def test_load_vectorstore_preserves_physical_page_numbers(
     vectorstore_environment,
 ):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     # Page 2 is blank and therefore has no extracted chunk.
     # Page 3 must retain its original physical PDF page number.
@@ -281,8 +303,15 @@ def test_load_vectorstore_preserves_physical_page_numbers(
 
     write_manifest(manifest_path, manifest)
 
-    assert rag_engine.load_vectorstore(force_reload=True) is True
-    assert [chunk["page_number"] for chunk in rag_engine.chunks] == [1, 3]
+    result = rag_engine.load_vectorstore(
+        vectorstore_dir=vectorstore_dir
+    )
+
+    assert result is not None
+
+    _, loaded_chunks = result
+
+    assert [chunk["page_number"] for chunk in loaded_chunks] == [1, 3]
 
 
 # ============================================================
@@ -293,7 +322,7 @@ def test_retrieve_context_returns_relevant_chunks(
     vectorstore_environment,
     monkeypatch,
 ):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     expected_chunks = create_chunks()
 
@@ -310,7 +339,11 @@ def test_retrieve_context_returns_relevant_chunks(
         FakeEmbeddingModel(),
     )
 
-    results = rag_engine.retrieve_context("First document", top_k=1)
+    results = rag_engine.retrieve_context(
+        "First document",
+        top_k=1,
+        vectorstore_dir=vectorstore_dir,
+    )
 
     assert results == [expected_chunks[0]]
     assert results[0]["page_number"] == 1
@@ -321,7 +354,7 @@ def test_retrieve_context_respects_top_k(
     vectorstore_environment,
     monkeypatch,
 ):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     manifest = create_generation(generations_dir)
     write_manifest(manifest_path, manifest)
@@ -332,7 +365,11 @@ def test_retrieve_context_respects_top_k(
         FakeEmbeddingModel(),
     )
 
-    results = rag_engine.retrieve_context("document", top_k=1)
+    results = rag_engine.retrieve_context(
+        "document",
+        top_k=1,
+        vectorstore_dir=vectorstore_dir,
+    )
 
     assert len(results) == 1
     assert isinstance(results[0], dict)
@@ -342,7 +379,7 @@ def test_retrieve_context_reloads_new_generation(
     vectorstore_environment,
     monkeypatch,
 ):
-    _, generations_dir, manifest_path = vectorstore_environment
+    vectorstore_dir, generations_dir, manifest_path = vectorstore_environment
 
     first_chunks = [
         {
@@ -368,8 +405,13 @@ def test_retrieve_context_reloads_new_generation(
         FakeEmbeddingModel(),
     )
 
-    assert rag_engine.load_vectorstore(force_reload=True) is True
-    assert rag_engine.chunks == first_chunks
+    first_results = rag_engine.retrieve_context(
+        "document",
+        top_k=1,
+        vectorstore_dir=vectorstore_dir,
+    )
+
+    assert first_results == first_chunks
 
     second_chunks = [
         {
@@ -389,23 +431,180 @@ def test_retrieve_context_reloads_new_generation(
 
     write_manifest(manifest_path, second_manifest)
 
-    results = rag_engine.retrieve_context("document", top_k=1)
+    results = rag_engine.retrieve_context(
+        "document",
+        top_k=1,
+        vectorstore_dir=vectorstore_dir,
+    )
 
     assert results == second_chunks
-    assert rag_engine.chunks == second_chunks
+
 
 
 def test_retrieve_context_rejects_invalid_query(
     vectorstore_environment,
 ):
-    assert rag_engine.retrieve_context("") == []
-    assert rag_engine.retrieve_context("   ") == []
-    assert rag_engine.retrieve_context(None) == []
+    vectorstore_dir, _, _ = vectorstore_environment
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        rag_engine.retrieve_context(
+            "", vectorstore_dir=vectorstore_dir
+        )
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        rag_engine.retrieve_context(
+            "   ", vectorstore_dir=vectorstore_dir
+        )
+
+    with pytest.raises(ValueError, match="non-empty string"):
+        rag_engine.retrieve_context(
+            None, vectorstore_dir=vectorstore_dir
+        )
 
 
 def test_retrieve_context_rejects_invalid_top_k(
     vectorstore_environment,
 ):
-    assert rag_engine.retrieve_context("question", top_k=0) == []
-    assert rag_engine.retrieve_context("question", top_k=-1) == []
-    assert rag_engine.retrieve_context("question", top_k=True) == []
+    vectorstore_dir, _, _ = vectorstore_environment
+
+    for invalid_top_k in (0, -1, True):
+        with pytest.raises(ValueError, match="positive integer"):
+            rag_engine.retrieve_context(
+                "question",
+                top_k=invalid_top_k,
+                vectorstore_dir=vectorstore_dir,
+            )
+
+
+def test_retrieve_context_isolates_separate_vectorstores(
+    vectorstore_environment,
+    tmp_path,
+    monkeypatch,
+):
+    first_dir, first_generations, first_manifest_path = (
+        vectorstore_environment
+    )
+
+    second_dir = tmp_path / "second_vectorstore"
+    second_generations = second_dir / "generations"
+    second_generations.mkdir(parents=True)
+    second_manifest_path = second_dir / "manifest.json"
+
+    first_chunks = [
+        {
+            "chunk_id": 0,
+            "text": "Confidential content belonging to session A",
+            "page_number": 1,
+            "document_name": "session_a.pdf",
+        }
+    ]
+
+    second_chunks = [
+        {
+            "chunk_id": 0,
+            "text": "Private content belonging to session B",
+            "page_number": 1,
+            "document_name": "session_b.pdf",
+        }
+    ]
+
+    first_manifest = create_generation(
+        first_generations,
+        chunks=first_chunks,
+        page_count=1,
+    )
+    first_manifest["document_name"] = "session_a.pdf"
+    write_manifest(first_manifest_path, first_manifest)
+
+    second_manifest = create_generation(
+        second_generations,
+        chunks=second_chunks,
+        page_count=1,
+    )
+    second_manifest["document_name"] = "session_b.pdf"
+    write_manifest(second_manifest_path, second_manifest)
+
+    monkeypatch.setattr(
+        rag_engine,
+        "embedding_model",
+        FakeEmbeddingModel(),
+    )
+
+    # Retrieve from session A.
+    first_results = rag_engine.retrieve_context(
+        "private content",
+        top_k=1,
+        vectorstore_dir=first_dir,
+    )
+
+    # Retrieve from session B.
+    second_results = rag_engine.retrieve_context(
+        "private content",
+        top_k=1,
+        vectorstore_dir=second_dir,
+    )
+
+    # Retrieve from session A again after accessing session B.
+    first_results_again = rag_engine.retrieve_context(
+        "private content",
+        top_k=1,
+        vectorstore_dir=first_dir,
+    )
+
+    assert first_results == first_chunks
+    assert second_results == second_chunks
+    assert first_results_again == first_chunks
+
+    assert first_results[0]["document_name"] != second_results[0]["document_name"]
+
+def test_ask_rag_uses_session_vectorstore(monkeypatch, tmp_path):
+    expected_chunks = [
+        {
+            "chunk_id": 0,
+            "text": "Session-specific content",
+            "page_number": 1,
+            "document_name": "session.pdf",
+        }
+    ]
+
+    calls = {}
+
+    def fake_retrieve_context(query, top_k, vectorstore_dir):
+        calls["query"] = query
+        calls["top_k"] = top_k
+        calls["vectorstore_dir"] = vectorstore_dir
+        return expected_chunks
+
+    class FakeResponse:
+        text = "The answer is 42. [Source: session.pdf, PDF page 1]"
+
+    class FakeClient:
+        def __init__(self):
+            self.models = self
+
+        def generate_content(self, **kwargs):
+            return FakeResponse()
+
+    vectorstore_dir = tmp_path / "session_a"
+
+    monkeypatch.setattr(
+        rag_engine,
+        "retrieve_context",
+        fake_retrieve_context,
+    )
+
+    monkeypatch.setattr(
+        rag_engine,
+        "_get_gemini_client",
+        lambda: FakeClient(),
+    )
+
+    answer = rag_engine.ask_rag(
+        "  What is the answer?  ",
+        vectorstore_dir=vectorstore_dir,
+    )
+
+    assert "42" in answer
+    assert calls["query"] == "What is the answer?"
+    assert calls["top_k"] == 3
+    assert calls["vectorstore_dir"] == vectorstore_dir

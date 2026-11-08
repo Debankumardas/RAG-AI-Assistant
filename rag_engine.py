@@ -18,6 +18,7 @@ from sentence_transformers import SentenceTransformer
 BASE_DIR = Path(__file__).resolve().parent
 
 VECTORSTORE_DIR = BASE_DIR / "vectorstore"
+GENERATIONS_DIR = VECTORSTORE_DIR / "generations"
 MANIFEST_PATH = VECTORSTORE_DIR / "manifest.json"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
@@ -25,61 +26,90 @@ GEMINI_MODEL = "gemini-3.6-flash"
 
 CHUNK_FORMAT_VERSION = 2
 
-
-# ============================================================
-# ENVIRONMENT AND MODEL INITIALIZATION
-# ============================================================
-
 load_dotenv()
+
+
+# ============================================================
+# SHARED MODELS
+# ============================================================
+
+embedding_model = SentenceTransformer(
+    EMBEDDING_MODEL,
+    local_files_only=True,
+)
 
 client = None
 
-embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
+
+def _get_gemini_client():
+    """Create the Gemini client lazily."""
+
+    global client
+
+    if client is not None:
+        return client
+
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY is not configured.")
+
+    client = genai.Client(api_key=api_key)
+
+    return client
 
 
 # ============================================================
-# VECTORSTORE STATE
+# VECTORSTORE PATHS
 # ============================================================
 
-index = None
-chunks = []
-
-_index_signature = None
-
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def _clear_vectorstore():
-    """Clear the currently loaded vectorstore from memory."""
-
-    global index, chunks, _index_signature
-
-    index = None
-    chunks = []
-    _index_signature = None
-
-
-def _get_manifest_data():
+def _get_vectorstore_paths(vectorstore_dir=None):
     """
-    Read and validate manifest.json.
+    Resolve vectorstore paths.
 
-    Only metadata-aware chunk format version 2 is accepted.
+    If no directory is supplied, use the default vectorstore.
+    Otherwise, use the supplied session-specific directory.
     """
 
-    if not MANIFEST_PATH.is_file():
-        raise FileNotFoundError(
-            f"Vectorstore manifest not found: {MANIFEST_PATH}"
-        )
+    if vectorstore_dir is None:
+        directory = Path(VECTORSTORE_DIR).resolve()
+        manifest_path = Path(MANIFEST_PATH).resolve()
+    else:
+        directory = Path(vectorstore_dir).resolve()
+        manifest_path = directory / "manifest.json"
 
-    with open(MANIFEST_PATH, "r", encoding="utf-8") as file:
-        manifest = json.load(file)
+    generations_dir = directory / "generations"
+
+    return directory, generations_dir, manifest_path
+
+
+# ============================================================
+# LOAD AND VALIDATE MANIFEST
+# ============================================================
+
+def _get_manifest_data(vectorstore_dir=None):
+    """Read and validate the vectorstore manifest."""
+
+    _, _, manifest_path = _get_vectorstore_paths(
+        vectorstore_dir
+    )
+
+    if not manifest_path.exists():
+        return None
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as file:
+            manifest = json.load(file)
+
+    except (OSError, json.JSONDecodeError):
+        return None
 
     if not isinstance(manifest, dict):
-        raise ValueError(
-            "Vectorstore manifest must contain a JSON object."
-        )
+        return None
 
     required_fields = {
         "generation_id",
@@ -92,105 +122,113 @@ def _get_manifest_data():
         "chunk_format_version",
     }
 
-    missing_fields = required_fields - manifest.keys()
+    if not required_fields.issubset(manifest):
+        return None
 
-    if missing_fields:
-        raise ValueError(
-            f"Manifest is missing required fields: {missing_fields}"
-        )
+    if not isinstance(manifest["generation_id"], str):
+        return None
 
-    if (
-        not isinstance(manifest["generation_id"], str)
-        or not manifest["generation_id"].strip()
-    ):
-        raise ValueError("Invalid generation ID in manifest.")
+    if not manifest["generation_id"].strip():
+        return None
 
     for field in ("index_path", "chunks_path"):
+        if not isinstance(manifest[field], str):
+            return None
+
+        if not manifest[field].strip():
+            return None
+
+    for field in (
+        "chunk_count",
+        "embedding_dimension",
+        "page_count",
+        "chunk_format_version",
+    ):
         if (
-            not isinstance(manifest[field], str)
-            or not manifest[field].strip()
+            not isinstance(manifest[field], int)
+            or isinstance(manifest[field], bool)
         ):
-            raise ValueError(f"Invalid {field} in manifest.")
+            return None
+
+    if manifest["chunk_count"] <= 0:
+        return None
+
+    if manifest["embedding_dimension"] <= 0:
+        return None
+
+    if manifest["page_count"] <= 0:
+        return None
 
     if (
-        not isinstance(manifest["chunk_count"], int)
-        or isinstance(manifest["chunk_count"], bool)
-        or manifest["chunk_count"] <= 0
+        manifest["chunk_format_version"]
+        != CHUNK_FORMAT_VERSION
     ):
-        raise ValueError("Invalid chunk count in manifest.")
+        return None
 
-    if (
-        not isinstance(manifest["embedding_dimension"], int)
-        or isinstance(manifest["embedding_dimension"], bool)
-        or manifest["embedding_dimension"] <= 0
-    ):
-        raise ValueError("Invalid embedding dimension in manifest.")
+    if not isinstance(manifest["document_name"], str):
+        return None
 
-    if (
-        not isinstance(manifest["document_name"], str)
-        or not manifest["document_name"].strip()
-    ):
-        raise ValueError("Invalid document name in manifest.")
-
-    if (
-        not isinstance(manifest["page_count"], int)
-        or isinstance(manifest["page_count"], bool)
-        or manifest["page_count"] <= 0
-    ):
-        raise ValueError("Invalid page count in manifest.")
-
-    if manifest["chunk_format_version"] != CHUNK_FORMAT_VERSION:
-        raise ValueError(
-            "Unsupported chunk format version. "
-            f"Expected {CHUNK_FORMAT_VERSION}, "
-            f"got {manifest['chunk_format_version']}."
-        )
+    if not manifest["document_name"].strip():
+        return None
 
     return manifest
 
 
-def _resolve_manifest_path(relative_path):
+# ============================================================
+# SAFE MANIFEST PATH RESOLUTION
+# ============================================================
+
+def _resolve_manifest_path(
+    relative_path,
+    vectorstore_dir=None,
+):
     """
-    Resolve a manifest path safely within VECTORSTORE_DIR.
+    Resolve a manifest path safely.
 
-    Prevents paths such as ../../some_other_file from being loaded.
+    Reject paths that escape the vectorstore directory.
     """
 
-    relative_path = Path(relative_path)
+    if not isinstance(relative_path, str):
+        return None
 
-    if relative_path.is_absolute():
-        raise ValueError("Manifest paths must be relative.")
+    if not relative_path.strip():
+        return None
 
-    base_path = VECTORSTORE_DIR.resolve()
-    resolved_path = (base_path / relative_path).resolve()
+    directory, _, _ = _get_vectorstore_paths(
+        vectorstore_dir
+    )
 
     try:
-        resolved_path.relative_to(base_path)
-    except ValueError:
-        raise ValueError(
-            "Manifest path points outside the vectorstore directory."
-        )
+        base_directory = directory.resolve()
+        resolved_path = (
+            base_directory / relative_path
+        ).resolve()
 
-    return resolved_path
+        resolved_path.relative_to(base_directory)
 
+        return resolved_path
+
+    except (ValueError, OSError):
+        return None
+
+
+# ============================================================
+# CHUNK METADATA VALIDATION
+# ============================================================
 
 def _validate_chunk_records(chunk_records, manifest):
-    """Validate the structure and metadata of stored chunk records."""
+    """Validate stored chunk records against the manifest."""
 
     if not isinstance(chunk_records, list):
-        raise ValueError("Stored chunks must be a list.")
+        return False
 
     if len(chunk_records) != manifest["chunk_count"]:
-        raise ValueError(
-            "Stored chunk count does not match manifest."
-        )
+        return False
 
-    for expected_id, chunk in enumerate(chunk_records):
+    for expected_id, record in enumerate(chunk_records):
 
-        if not isinstance(chunk, dict):
-            raise ValueError(
-                f"Chunk {expected_id} must be a dictionary."
-            )
+        if not isinstance(record, dict):
+            return False
 
         required_fields = {
             "chunk_id",
@@ -199,206 +237,197 @@ def _validate_chunk_records(chunk_records, manifest):
             "document_name",
         }
 
-        missing_fields = required_fields - chunk.keys()
+        if not required_fields.issubset(record):
+            return False
 
-        if missing_fields:
-            raise ValueError(
-                f"Chunk {expected_id} is missing fields: {missing_fields}"
-            )
-
-        if (
-            not isinstance(chunk["chunk_id"], int)
-            or isinstance(chunk["chunk_id"], bool)
-            or chunk["chunk_id"] != expected_id
-        ):
-            raise ValueError(
-                f"Invalid chunk ID at position {expected_id}."
-            )
+        chunk_id = record["chunk_id"]
+        text = record["text"]
+        page_number = record["page_number"]
+        document_name = record["document_name"]
 
         if (
-            not isinstance(chunk["text"], str)
-            or not chunk["text"].strip()
+            not isinstance(chunk_id, int)
+            or isinstance(chunk_id, bool)
+            or chunk_id != expected_id
         ):
-            raise ValueError(
-                f"Chunk {expected_id} contains invalid text."
-            )
+            return False
+
+        if not isinstance(text, str) or not text.strip():
+            return False
 
         if (
-            not isinstance(chunk["page_number"], int)
-            or isinstance(chunk["page_number"], bool)
-            or chunk["page_number"] < 1
+            not isinstance(page_number, int)
+            or isinstance(page_number, bool)
+            or page_number <= 0
         ):
-            raise ValueError(
-                f"Chunk {expected_id} has an invalid PDF page number."
-            )
+            return False
 
-        if (
-            not isinstance(chunk["document_name"], str)
-            or chunk["document_name"] != manifest["document_name"]
-        ):
-            raise ValueError(
-                f"Chunk {expected_id} has an invalid document name."
-            )
+        if document_name != manifest["document_name"]:
+            return False
+
+    return True
 
 
-def get_vectorstore_signature():
+# ============================================================
+# VECTORSTORE SIGNATURE
+# ============================================================
+
+def get_vectorstore_signature(vectorstore_dir=None):
     """
-    Return a signature representing the current vectorstore generation.
+    Return a signature describing the current vectorstore.
 
-    Returns None if the manifest or referenced files are missing or invalid.
+    Returns None when the manifest or referenced files are
+    missing or invalid.
     """
+
+    manifest = _get_manifest_data(vectorstore_dir)
+
+    if manifest is None:
+        return None
+
+    index_path = _resolve_manifest_path(
+        manifest["index_path"],
+        vectorstore_dir,
+    )
+
+    chunks_path = _resolve_manifest_path(
+        manifest["chunks_path"],
+        vectorstore_dir,
+    )
+
+    if index_path is None or chunks_path is None:
+        return None
 
     try:
-        manifest = _get_manifest_data()
-
-        index_path = _resolve_manifest_path(manifest["index_path"])
-        chunks_path = _resolve_manifest_path(manifest["chunks_path"])
-
-        if not index_path.is_file() or not chunks_path.is_file():
-            return None
-
-        manifest_stat = MANIFEST_PATH.stat()
         index_stat = index_path.stat()
         chunks_stat = chunks_path.stat()
 
-        return (
-            manifest["generation_id"],
-            manifest_stat.st_mtime_ns,
-            manifest_stat.st_size,
-            str(index_path),
-            index_stat.st_mtime_ns,
-            index_stat.st_size,
-            str(chunks_path),
-            chunks_stat.st_mtime_ns,
-            chunks_stat.st_size,
-        )
-
-    except (OSError, ValueError, json.JSONDecodeError, KeyError):
+    except OSError:
         return None
 
+    return (
+        manifest["generation_id"],
+        index_stat.st_size,
+        index_stat.st_mtime_ns,
+        chunks_stat.st_size,
+        chunks_stat.st_mtime_ns,
+    )
+
 
 # ============================================================
-# VECTORSTORE LOADING
+# LOAD VECTORSTORE
 # ============================================================
 
-def load_vectorstore(force_reload=False):
+def load_vectorstore(
+    force_reload=False,
+    vectorstore_dir=None,
+):
     """
-    Load and validate the active metadata-aware vectorstore.
-
-    Global state is updated only after all validation succeeds.
-    """
-
-    global index, chunks, _index_signature
-
-    current_signature = get_vectorstore_signature()
-
-    if current_signature is None:
-        print("[WARNING] No valid vectorstore generation found.")
-        _clear_vectorstore()
-        return False
-
-    if (
-        not force_reload
-        and index is not None
-        and _index_signature == current_signature
-    ):
-        return True
-
-    try:
-        print("[INFO] Loading vectorstore generation...")
-
-        manifest = _get_manifest_data()
-
-        index_path = _resolve_manifest_path(manifest["index_path"])
-        chunks_path = _resolve_manifest_path(manifest["chunks_path"])
-
-        new_index = faiss.read_index(str(index_path))
-
-        with open(chunks_path, "rb") as file:
-            new_chunks = pickle.load(file)
-
-        _validate_chunk_records(new_chunks, manifest)
-
-        if new_index.ntotal != len(new_chunks):
-            raise ValueError(
-                "FAISS index and chunk count do not match. "
-                f"Index: {new_index.ntotal}, "
-                f"chunks: {len(new_chunks)}"
-            )
-
-        if new_index.d != manifest["embedding_dimension"]:
-            raise ValueError(
-                "FAISS embedding dimension does not match manifest."
-            )
-
-        updated_signature = get_vectorstore_signature()
-
-        if updated_signature != current_signature:
-            raise RuntimeError(
-                "Vectorstore changed while it was being loaded. "
-                "Retry the operation."
-            )
-
-        # Publish state only after successful validation.
-        index = new_index
-        chunks = new_chunks
-        _index_signature = current_signature
-
-        print("[SUCCESS] Vectorstore loaded successfully.")
-        print(f"[INFO] Generation: {manifest['generation_id']}")
-        print(f"[INFO] Document: {manifest['document_name']}")
-        print(f"[INFO] Pages: {manifest['page_count']}")
-        print(f"[INFO] Chunks loaded: {len(chunks)}")
-        print(f"[INFO] Embedding dimension: {index.d}")
-
-        return True
-
-    except Exception as error:
-        print(f"[ERROR] Failed to load vectorstore: {error}")
-        _clear_vectorstore()
-        return False
-
-
-# ============================================================
-# RETRIEVAL
-# ============================================================
-
-def retrieve_context(query, top_k=3):
-    """
-    Retrieve relevant metadata-aware chunk records.
+    Load and validate a vectorstore.
 
     Returns:
-        list[dict]: Retrieved chunks containing text and source metadata.
+        (index, chunks) on success.
+        None on failure.
+
+    No shared mutable retrieval state is maintained.
     """
 
+    manifest = _get_manifest_data(vectorstore_dir)
+
+    if manifest is None:
+        return None
+
+    index_path = _resolve_manifest_path(
+        manifest["index_path"],
+        vectorstore_dir,
+    )
+
+    chunks_path = _resolve_manifest_path(
+        manifest["chunks_path"],
+        vectorstore_dir,
+    )
+
+    if index_path is None or chunks_path is None:
+        return None
+
+    if not index_path.is_file() or not chunks_path.is_file():
+        return None
+
+    try:
+        loaded_index = faiss.read_index(str(index_path))
+
+        with open(chunks_path, "rb") as file:
+            loaded_chunks = pickle.load(file)
+
+    except Exception:
+        return None
+
+    if not _validate_chunk_records(
+        loaded_chunks,
+        manifest,
+    ):
+        return None
+
+    if loaded_index.ntotal != manifest["chunk_count"]:
+        return None
+
+    if loaded_index.d != manifest["embedding_dimension"]:
+        return None
+
+    if loaded_index.ntotal != len(loaded_chunks):
+        return None
+
+    # Confirm that the manifest still references the same
+    # generation after loading the files.
+    latest_manifest = _get_manifest_data(vectorstore_dir)
+
+    if latest_manifest is None:
+        return None
+
+    if (
+        latest_manifest["generation_id"]
+        != manifest["generation_id"]
+    ):
+        return None
+
+    return loaded_index, loaded_chunks
+
+
+# ============================================================
+# RETRIEVE RELEVANT CONTEXT
+# ============================================================
+
+def retrieve_context(
+    query,
+    top_k=3,
+    vectorstore_dir=None,
+):
+    """Retrieve the most relevant chunks for a query."""
+
     if not isinstance(query, str) or not query.strip():
-        return []
+        raise ValueError("Query must be a non-empty string.")
 
     if (
         not isinstance(top_k, int)
         or isinstance(top_k, bool)
         or top_k <= 0
     ):
+        raise ValueError("top_k must be a positive integer.")
+
+    vectorstore = load_vectorstore(
+        vectorstore_dir=vectorstore_dir
+    )
+
+    if vectorstore is None:
         return []
 
-    current_signature = get_vectorstore_signature()
-
-    if current_signature is None:
-        print("[WARNING] No valid vectorstore available.")
-        _clear_vectorstore()
-        return []
-
-    if index is None or _index_signature != current_signature:
-        if not load_vectorstore():
-            return []
-
-    if index is None or not chunks:
-        return []
+    index, chunks = vectorstore
 
     try:
         query_embedding = embedding_model.encode(
-            [query],
+            [query.strip()],
             normalize_embeddings=True,
+            show_progress_bar=False,
         )
 
         query_embedding = np.asarray(
@@ -406,130 +435,105 @@ def retrieve_context(query, top_k=3):
             dtype=np.float32,
         )
 
-        if (
-            query_embedding.ndim != 2
-            or query_embedding.shape[0] != 1
-            or not np.isfinite(query_embedding).all()
-        ):
-            raise ValueError("Invalid query embedding.")
-
-        if query_embedding.shape[1] != index.d:
-            raise ValueError(
-                "Query embedding dimension does not match FAISS index."
-            )
-
-        k = min(top_k, index.ntotal)
-
-        if k <= 0:
-            return []
-
-        scores, indices = index.search(query_embedding, k)
-
-        retrieved_chunks = []
-
-        for chunk_index in indices[0]:
-            if 0 <= chunk_index < len(chunks):
-                retrieved_chunks.append(chunks[chunk_index])
-
-        return retrieved_chunks
-
-    except Exception as error:
-        print(f"[ERROR] Retrieval failed: {error}")
+    except Exception:
         return []
 
+    if query_embedding.ndim != 2:
+        return []
 
-# ============================================================
-# GEMINI CLIENT
-# ============================================================
+    if query_embedding.shape[0] != 1:
+        return []
 
-def _get_gemini_client():
-    """Create and cache the Gemini client."""
+    if query_embedding.shape[1] != index.d:
+        return []
 
-    global client
+    if not np.isfinite(query_embedding).all():
+        return []
 
-    if client is not None:
-        return client
-
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    if not api_key:
-        raise ValueError(
-            "GEMINI_API_KEY is missing. Add it to your .env file."
+    try:
+        scores, indices = index.search(
+            query_embedding,
+            min(top_k, index.ntotal),
         )
 
-    client = genai.Client(api_key=api_key)
+    except Exception:
+        return []
 
-    return client
+    results = []
+
+    for chunk_index in indices[0]:
+
+        if chunk_index < 0:
+            continue
+
+        if chunk_index >= len(chunks):
+            continue
+
+        results.append(chunks[int(chunk_index)])
+
+    return results
 
 
 # ============================================================
-# RAG RESPONSE GENERATION
+# RAG RESPONSE
 # ============================================================
 
-def ask_rag(query):
-    """
-    Generate an answer using retrieved document context and Gemini.
-
-    Source metadata is included in the prompt so answers can cite
-    the original PDF pages.
-    """
+def ask_rag(query, vectorstore_dir=None):
+    """Retrieve context and generate an answer using Gemini."""
 
     if not isinstance(query, str) or not query.strip():
         return "Please enter a valid question."
 
-    print("\n" + "=" * 60)
-    print("RAG QUERY")
-    print("=" * 60)
-
-    print(f"\nQuestion: {query}")
-
-    retrieved_chunks = retrieve_context(query, top_k=3)
+    retrieved_chunks = retrieve_context(
+        query.strip(),
+        top_k=3,
+        vectorstore_dir=vectorstore_dir,
+    )
 
     if not retrieved_chunks:
         return (
-            "I couldn't find relevant information in the uploaded "
-            "documents. Please upload and process a document first."
+            "No relevant document context was found. "
+            "Please upload a document first or ask a question "
+            "related to the uploaded document."
         )
 
     context_parts = []
 
     for chunk in retrieved_chunks:
 
-        source = (
-            f"Document: {chunk['document_name']}\n"
-            f"PDF page: {chunk['page_number']}\n"
-            f"Chunk ID: {chunk['chunk_id']}"
-        )
+        document_name = chunk["document_name"]
+        page_number = chunk["page_number"]
+        chunk_id = chunk["chunk_id"]
+        chunk_text = chunk["text"]
 
         context_parts.append(
-            f"[{source}]\n{chunk['text']}"
+            f"[Document: {document_name}\n"
+            f"PDF page: {page_number}\n"
+            f"Chunk ID: {chunk_id}]\n"
+            f"{chunk_text}"
         )
 
     context = "\n\n".join(context_parts)
 
     prompt = f"""
-You are a document-based AI assistant.
+You are a document question-answering assistant.
 
-Answer the user's question using ONLY the information provided
-in the document context below.
+Answer the user's question using ONLY the supplied context.
 
 Rules:
-1. Do not invent facts or information.
-2. Do not use outside knowledge.
-3. If the answer is not available in the context, clearly say so.
-4. Give a clear and concise answer.
-5. Organize the answer into bullet points when appropriate.
-6. When making a factual claim, cite its source using this exact format:
+1. Do not use outside knowledge.
+2. If the context does not contain the answer, say so clearly.
+3. Do not invent facts, document names, page numbers, or citations.
+4. Cite supporting information using this exact format:
    [Source: document_name, PDF page N]
-7. Only cite documents and page numbers explicitly provided in the context.
-8. Do not invent citations.
-9. If multiple pages support the answer, cite each relevant page.
+5. Only cite document names and page numbers present in the context.
+6. Be clear and concise.
 
-DOCUMENT CONTEXT:
+CONTEXT:
 {context}
 
 USER QUESTION:
-{query}
+{query.strip()}
 
 ANSWER:
 """
@@ -542,18 +546,18 @@ ANSWER:
             contents=prompt,
         )
 
-        answer = response.text
+        answer = getattr(response, "text", None)
 
         if not answer or not answer.strip():
-            return "The AI model returned an empty response."
+            return "The language model returned an empty response."
 
         return answer.strip()
 
     except Exception as error:
-        print(f"[ERROR] Gemini response generation failed: {error}")
+        print(f"Gemini generation error: {error}")
 
         return (
-            "An error occurred while generating the answer. "
+            "I encountered an error while generating the answer. "
             "Please check your Gemini API configuration and try again."
         )
 
@@ -564,29 +568,9 @@ ANSWER:
 
 if __name__ == "__main__":
 
-    print("\nTesting vectorstore loading...")
+    question = input("Ask a question about your document: ")
 
-    if load_vectorstore(force_reload=True):
+    answer = ask_rag(question)
 
-        print("\nVectorstore loaded successfully.")
-
-        test_query = "What is the main topic of the document?"
-
-        print(f"\nTest query: {test_query}")
-
-        results = retrieve_context(test_query, top_k=3)
-
-        print("\nRetrieved context:")
-
-        for i, chunk in enumerate(results, start=1):
-            print(f"\n--- Chunk {i} ---")
-            print(f"Document: {chunk['document_name']}")
-            print(f"PDF page: {chunk['page_number']}")
-            print(f"Chunk ID: {chunk['chunk_id']}")
-            print(chunk["text"])
-
-    else:
-        print(
-            "\nNo valid metadata-aware vectorstore found. "
-            "Process a PDF document first."
-        )
+    print("\nANSWER:\n")
+    print(answer)
