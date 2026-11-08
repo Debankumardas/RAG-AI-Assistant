@@ -1,105 +1,141 @@
+
 import pymupdf
 
 
 # ============================================================
-# EXTRACT TEXT FROM PDF
+# EXTRACT TEXT FROM PDF PAGE BY PAGE
 # ============================================================
 
-def extract_text_from_pdf(pdf_path):
+def extract_pages_from_pdf(pdf_path):
+    """
+    Extract text from each PDF page separately.
 
-    document = pymupdf.open(pdf_path)
+    Returns:
+        list[dict]: Each record contains the physical PDF page
+        number and extracted text.
+    """
 
     pages = []
 
-    for page in document:
+    with pymupdf.open(pdf_path) as document:
+        for page_number, page in enumerate(document, start=1):
 
-        text = page.get_text()
+            text = page.get_text()
 
-        if text.strip():
-            pages.append(text)
+            if text.strip():
+                pages.append({
+                    "page_number": page_number,
+                    "text": text
+                })
 
-    document.close()
-
-    return "\n".join(pages)
+    return pages
 
 
 # ============================================================
-# CREATE BETTER CHUNKS
+# CREATE PAGE-AWARE CHUNKS
 # ============================================================
 
-def create_chunks(text, chunk_size=500, overlap=100):
+def create_chunks(
+    pages,
+    chunk_size=500,
+    overlap=100,
+    document_name="unknown.pdf"
+):
     """
-    Create chunks without cutting words in the middle.
+    Split PDF pages into word-based chunks.
 
-    Chunks are built from complete words.
-    Overlap is also kept at word boundaries.
+    Guarantees:
+    - Words are never split.
+    - Chunks never exceed chunk_size.
+    - Overlap is kept as close as possible to the requested size.
+    - Chunks never cross PDF page boundaries.
+    - Every chunk retains its page number and document name.
     """
 
-    # Normalize whitespace
-    words = text.replace("\r\n", "\n").replace("\r", "\n").split()
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be greater than zero.")
+
+    if overlap < 0:
+        raise ValueError("overlap cannot be negative.")
+
+    if overlap >= chunk_size:
+        raise ValueError("overlap must be smaller than chunk_size.")
 
     chunks = []
 
-    current_words = []
-    current_length = 0
+    for page in pages:
 
-    for word in words:
+        page_number = page["page_number"]
+        text = page["text"]
 
-        # +1 accounts for the space between words
-        new_length = current_length + len(word) + (
-            1 if current_words else 0
+        words = (
+            text.replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .split()
         )
 
-        if new_length <= chunk_size:
+        current_words = []
 
-            current_words.append(word)
-            current_length = new_length
+        for word in words:
 
-        else:
+            if len(word) > chunk_size:
+                raise ValueError(
+                    f"Word exceeds chunk_size ({chunk_size} characters): {word}"
+                )
 
-            # Save current chunk
+            candidate = " ".join(current_words + [word])
+
+            if len(candidate) <= chunk_size:
+                current_words.append(word)
+                continue
+
             if current_words:
-                chunks.append(" ".join(current_words))
+                chunks.append({
+                    "chunk_id": len(chunks),
+                    "text": " ".join(current_words),
+                    "page_number": page_number,
+                    "document_name": document_name
+                })
 
-            # ------------------------------------------------
-            # Create word-based overlap
-            # ------------------------------------------------
-
+            # Build the largest possible overlap from previous words.
             overlap_words = []
-            overlap_length = 0
 
             for previous_word in reversed(current_words):
 
-                added_length = len(previous_word) + (
-                    1 if overlap_words else 0
+                candidate_overlap = " ".join(
+                    [previous_word] + overlap_words
                 )
 
-                if overlap_length + added_length > overlap:
+                if len(candidate_overlap) > overlap:
                     break
 
-                overlap_words.insert(
-                    0,
-                    previous_word
-                )
+                overlap_words.insert(0, previous_word)
 
-                overlap_length += added_length
+            # Reduce overlap if it prevents the next word from fitting.
+            while overlap_words:
 
-            # Start new chunk with overlap + current word
+                candidate = " ".join(overlap_words + [word])
+
+                if len(candidate) <= chunk_size:
+                    break
+
+                overlap_words.pop(0)
+
             current_words = overlap_words + [word]
 
-            current_length = sum(
-                len(w) for w in current_words
-            ) + len(current_words) - 1
-
-    # Add final chunk
-    if current_words:
-        chunks.append(" ".join(current_words))
+        if current_words:
+            chunks.append({
+                "chunk_id": len(chunks),
+                "text": " ".join(current_words),
+                "page_number": page_number,
+                "document_name": document_name
+            })
 
     return chunks
 
 
 # ============================================================
-# TEST
+# MANUAL TEST
 # ============================================================
 
 if __name__ == "__main__":
@@ -111,32 +147,45 @@ if __name__ == "__main__":
     print("=" * 60)
 
     # --------------------------------------------------------
-    # Extract text
+    # STEP 1: Extract pages
     # --------------------------------------------------------
 
-    text = extract_text_from_pdf(pdf_path)
+    pages = extract_pages_from_pdf(pdf_path)
 
-    print(f"\nExtracted characters: {len(text)}")
+    print(f"\nExtracted pages: {len(pages)}")
+
+    total_characters = sum(
+        len(page["text"]) for page in pages
+    )
+
+    print(f"Extracted characters: {total_characters}")
 
     # --------------------------------------------------------
-    # Create chunks
+    # STEP 2: Create page-aware chunks
     # --------------------------------------------------------
 
-    chunks = create_chunks(text)
+    chunks = create_chunks(
+        pages,
+        chunk_size=500,
+        overlap=100,
+        document_name=pdf_path
+    )
 
     print(f"Created chunks: {len(chunks)}")
 
     # --------------------------------------------------------
-    # Display chunks
+    # STEP 3: Display chunks
     # --------------------------------------------------------
 
-    for i, chunk in enumerate(chunks):
+    for chunk in chunks:
 
         print("\n" + "=" * 60)
-        print(f"CHUNK {i + 1}")
+        print(f"CHUNK {chunk['chunk_id']}")
+        print(f"PAGE: {chunk['page_number']}")
+        print(f"DOCUMENT: {chunk['document_name']}")
         print("=" * 60)
 
-        print(chunk)
+        print(chunk["text"])
 
     print("\n" + "=" * 60)
     print("PDF PROCESSING COMPLETED")

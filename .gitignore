@@ -1,5 +1,22 @@
+# Environment variables and secrets
 .env
+.env.*
+
+# Python virtual environments
 venv/
+.venv/
+
+# Python cache files
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Pytest cache
+.pytest_cache/
+
+# Generated vectorstore data
 vectorstore/
+
+# IDE and editor files
+.vscode/
+.idea/
