@@ -1,32 +1,27 @@
+
+import json
 import os
 import pickle
+import shutil
+import uuid
+from pathlib import Path
 
 import faiss
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
-from document_processor import extract_text_from_pdf, create_chunks
+from document_processor import extract_pages_from_pdf, create_chunks
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = Path(__file__).resolve().parent
 
-VECTORSTORE_DIR = os.path.join(
-    BASE_DIR,
-    "vectorstore"
-)
-
-INDEX_PATH = os.path.join(
-    VECTORSTORE_DIR,
-    "index.faiss"
-)
-
-CHUNKS_PATH = os.path.join(
-    VECTORSTORE_DIR,
-    "chunks.pkl"
-)
+VECTORSTORE_DIR = BASE_DIR / "vectorstore"
+GENERATIONS_DIR = VECTORSTORE_DIR / "generations"
+MANIFEST_PATH = VECTORSTORE_DIR / "manifest.json"
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
@@ -49,9 +44,26 @@ print("Embedding model loaded.")
 # PROCESS DOCUMENT
 # ============================================================
 
-def process_document(pdf_path):
+def process_document(pdf_path, vectorstore_dir=None):
+    """
+    Process a PDF and publish a new versioned vectorstore generation.
 
-    # Convert to absolute path
+    Each stored chunk retains:
+    - Chunk ID
+    - Text
+    - Physical PDF page number
+    - Document name
+
+    The previous generation remains untouched until the new
+    generation has been written, verified, and published.
+    """
+    vectorstore_dir = Path(
+    vectorstore_dir or VECTORSTORE_DIR
+    ).resolve()
+
+    generations_dir = vectorstore_dir / "generations"
+    manifest_path = vectorstore_dir / "manifest.json"
+
     pdf_path = os.path.abspath(pdf_path)
 
     if not os.path.exists(pdf_path):
@@ -60,36 +72,44 @@ def process_document(pdf_path):
             "message": f"PDF not found: {pdf_path}"
         }
 
+    document_name = os.path.basename(pdf_path)
+
     print("\n" + "=" * 60)
     print("DOCUMENT PROCESSING")
     print("=" * 60)
 
     # --------------------------------------------------------
-    # STEP 1 — Extract text
+    # STEP 1: EXTRACT PDF PAGES
     # --------------------------------------------------------
 
-    print("\n[1/4] Extracting PDF text...")
+    print("\n[1/4] Extracting PDF pages...")
 
-    text = extract_text_from_pdf(pdf_path)
+    pages = extract_pages_from_pdf(pdf_path)
 
-    print(f"Extracted characters: {len(text)}")
-
-    if not text.strip():
+    if not pages:
         return {
             "success": False,
             "message": "No text could be extracted from the PDF."
         }
 
+    total_characters = sum(
+        len(page["text"]) for page in pages
+    )
+
+    print(f"Extracted pages: {len(pages)}")
+    print(f"Extracted characters: {total_characters}")
+
     # --------------------------------------------------------
-    # STEP 2 — Create chunks
+    # STEP 2: CREATE PAGE-AWARE CHUNKS
     # --------------------------------------------------------
 
-    print("\n[2/4] Creating chunks...")
+    print("\n[2/4] Creating page-aware chunks...")
 
     chunks = create_chunks(
-        text,
+        pages,
         chunk_size=500,
-        overlap=100
+        overlap=100,
+        document_name=document_name
     )
 
     print(f"Created chunks: {len(chunks)}")
@@ -100,128 +120,240 @@ def process_document(pdf_path):
             "message": "No chunks were created from the document."
         }
 
+    # Extract only text for embedding.
+    # Keep the complete dictionaries for storage.
+
+    chunk_texts = [
+        chunk["text"] for chunk in chunks
+    ]
+
     # --------------------------------------------------------
-    # STEP 3 — Generate embeddings
+    # STEP 3: GENERATE EMBEDDINGS
     # --------------------------------------------------------
 
     print("\n[3/4] Generating embeddings...")
 
     embeddings = embedding_model.encode(
-        chunks,
+        chunk_texts,
         normalize_embeddings=True,
         show_progress_bar=True
     )
 
+    embeddings = np.ascontiguousarray(
+        embeddings,
+        dtype=np.float32
+    )
+
+    if embeddings.ndim != 2:
+        raise ValueError(
+            "Embeddings must be a two-dimensional array."
+        )
+
+    if embeddings.shape[0] != len(chunks):
+        raise ValueError(
+            "Number of embeddings does not match number of chunks."
+        )
+
+    if embeddings.shape[0] == 0 or embeddings.shape[1] == 0:
+        raise ValueError("Generated embeddings are empty.")
+
+    if not np.isfinite(embeddings).all():
+        raise ValueError(
+            "Embeddings contain invalid numeric values."
+        )
+
+    dimension = embeddings.shape[1]
+
     print(f"Embedding shape: {embeddings.shape}")
 
     # --------------------------------------------------------
-    # STEP 4 — Create FAISS index
+    # STEP 4: CREATE FAISS INDEX
     # --------------------------------------------------------
 
     print("\n[4/4] Creating FAISS index...")
 
-    dimension = embeddings.shape[1]
-
     index = faiss.IndexFlatIP(dimension)
-
     index.add(embeddings)
 
     # --------------------------------------------------------
-    # Create vectorstore directory
+    # CREATE A NEW GENERATION
     # --------------------------------------------------------
 
-    os.makedirs(
-        VECTORSTORE_DIR,
-        exist_ok=True
+    generation_id = uuid.uuid4().hex
+
+    generation_dir = generations_dir / generation_id
+
+    index_path = generation_dir / "index.faiss"
+    chunks_path = generation_dir / "chunks.pkl"
+
+    manifest_temp_path = vectorstore_dir / (
+        f"manifest.{generation_id}.tmp"
     )
 
-
-    # --------------------------------------------------------
-    # Save vectorstore safely
-    # --------------------------------------------------------
-
-    os.makedirs(
-        VECTORSTORE_DIR,
-        exist_ok=True
-    )
-
-    temp_index_path = INDEX_PATH + ".tmp"
-    temp_chunks_path = CHUNKS_PATH + ".tmp"
+    published = False
 
     try:
+        # ----------------------------------------------------
+        # CREATE DIRECTORIES
+        # ----------------------------------------------------
 
-        # Write both temporary files first.
+        vectorstore_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        generations_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        generation_dir.mkdir(
+            parents=True,
+            exist_ok=False
+        )
+
+        # ----------------------------------------------------
+        # SAVE FAISS INDEX
+        # ----------------------------------------------------
+
         faiss.write_index(
             index,
-            temp_index_path
+            str(index_path)
         )
 
-        with open(temp_chunks_path, "wb") as f:
-            pickle.dump(chunks, f)
+        # ----------------------------------------------------
+        # SAVE STRUCTURED CHUNKS
+        # ----------------------------------------------------
 
-        # Replace the existing files only after both writes succeed.
+        with open(chunks_path, "wb") as file:
+
+            pickle.dump(chunks, file)
+
+            file.flush()
+            os.fsync(file.fileno())
+
+        # ----------------------------------------------------
+        # VERIFY SAVED ARTIFACTS
+        # ----------------------------------------------------
+
+        verified_index = faiss.read_index(
+            str(index_path)
+        )
+
+        with open(chunks_path, "rb") as file:
+            verified_chunks = pickle.load(file)
+
+        if verified_index.ntotal != len(verified_chunks):
+            raise ValueError(
+                "Saved FAISS index and chunks do not match."
+            )
+
+        if verified_index.d != dimension:
+            raise ValueError(
+                "Saved FAISS index has an incorrect embedding dimension."
+            )
+
+        if verified_chunks != chunks:
+            raise ValueError(
+                "Saved chunks do not match the original chunks."
+            )
+
+        # ----------------------------------------------------
+        # PREPARE MANIFEST
+        # ----------------------------------------------------
+
+        manifest = {
+            "generation_id": generation_id,
+            "index_path": (
+                f"generations/{generation_id}/index.faiss"
+            ),
+            "chunks_path": (
+                f"generations/{generation_id}/chunks.pkl"
+            ),
+            "chunk_count": len(chunks),
+            "embedding_dimension": dimension,
+            "document_name": document_name,
+            "page_count": len(pages),
+            "chunk_format_version": 2
+        }
+
+        with open(
+            manifest_temp_path,
+            "w",
+            encoding="utf-8"
+        ) as file:
+
+            json.dump(
+                manifest,
+                file,
+                indent=4
+            )
+
+            file.flush()
+            os.fsync(file.fileno())
+
+        # ----------------------------------------------------
+        # ATOMICALLY PUBLISH NEW GENERATION
+        # ----------------------------------------------------
+
+        # The previous manifest remains active if replacement fails.
+
         os.replace(
-            temp_index_path,
-            INDEX_PATH
+            manifest_temp_path,
+            manifest_path
         )
 
-        os.replace(
-            temp_chunks_path,
-            CHUNKS_PATH
-        )
+        published = True
 
     finally:
 
-        # Clean up temporary files if anything failed.
-        for temp_path in (
-            temp_index_path,
-            temp_chunks_path
-        ):
+        # Remove unpublished temporary manifest.
+        if manifest_temp_path.exists():
+            manifest_temp_path.unlink()
 
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-
+        # Remove incomplete generation after failure.
+        if not published and generation_dir.exists():
+            shutil.rmtree(generation_dir)
 
     # --------------------------------------------------------
-    # Final result
+    # FINAL RESULT
     # --------------------------------------------------------
 
     print("\n" + "=" * 60)
     print("DOCUMENT PROCESSED SUCCESSFULLY")
     print("=" * 60)
 
-    print(f"Document: {os.path.basename(pdf_path)}")
-    print(f"Characters: {len(text)}")
+    print(f"Document: {document_name}")
+    print(f"Pages: {len(pages)}")
+    print(f"Characters: {total_characters}")
     print(f"Chunks: {len(chunks)}")
     print(f"Embedding dimension: {dimension}")
-
-    print(f"\nFAISS index: {INDEX_PATH}")
-    print(f"Chunks file: {CHUNKS_PATH}")
+    print(f"Generation: {generation_id}")
+    print(f"Manifest: {manifest_path}")
 
     print("=" * 60)
 
     return {
         "success": True,
         "message": "Document processed successfully.",
-        "filename": os.path.basename(pdf_path),
-        "characters": len(text),
+        "filename": document_name,
+        "pages": len(pages),
+        "characters": total_characters,
         "chunks": len(chunks),
-        "dimension": dimension
+        "dimension": dimension,
+        "generation_id": generation_id,
     }
 
 
 # ============================================================
-# TEST
+# MANUAL TEST
 # ============================================================
 
 if __name__ == "__main__":
 
-    pdf_path = os.path.join(
-        BASE_DIR,
-        "sample.pdf"
-    )
+    pdf_path = BASE_DIR / "sample.pdf"
 
-    result = process_document(pdf_path)
+    result = process_document(str(pdf_path))
 
     print("\nRESULT:")
     print(result)
